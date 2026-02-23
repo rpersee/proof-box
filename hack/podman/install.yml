@@ -1,0 +1,177 @@
+---
+- name: Ensure buildx binary is available
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - env
+    - user_id
+
+  vars:
+    buildx_release: >-
+      {{ lookup('url', 'https://api.github.com/repos/docker/buildx/releases/latest')
+         | from_json }}
+    buildx_tag: "{{ buildx_release.tag_name }}"
+    buildx_bin_image: "localhost/buildx-bin:{{ buildx_tag }}"
+    binaries_dir: >-
+      {{ '/usr/local/bin' if ansible_user_uid == 0
+        else ansible_env.HOME ~ '/.local/bin' }}
+
+  tasks:
+    - name: Check if buildx is already in PATH
+      ansible.builtin.shell: command -v buildx # noqa: command-instead-of-shell
+      register: buildx_lookup
+      failed_when: false
+      changed_when: false
+
+    - name: End play if buildx is installed
+      ansible.builtin.meta: end_play
+      when:
+        - buildx_lookup.rc == 0
+        - not ansible_check_mode
+
+    - name: Ensure binaries directory exists
+      ansible.builtin.file:
+        path: "{{ binaries_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Build buildx binary using Podman
+      containers.podman.podman_image:
+        name: "{{ buildx_bin_image }}"
+        state: build
+        path: "{{ playbook_dir }}"
+        build:
+          extra_args: "--build-arg BUILDX_REF={{ buildx_tag }}"
+
+    - name: Extract buildx binary from image
+      become: true
+      become_method: containers.podman.podman_unshare
+      block:
+        - name: Mount buildx binary image in Podman user namespace
+          ansible.builtin.command: podman image mount {{ buildx_bin_image }}
+          register: mount_path
+          changed_when: true
+
+        - name: Copy buildx binary from mounted image
+          ansible.builtin.copy:
+            src: "{{ mount_path.stdout }}/buildx"
+            dest: "{{ binaries_dir }}/buildx"
+            mode: "0755"
+            remote_src: true
+          when: not ansible_check_mode
+
+      always:
+        - name: Unmount buildx binary image
+          ansible.builtin.command: podman image unmount {{ buildx_bin_image }}
+          changed_when: true
+
+    - name: Lookup built buildx version
+      ansible.builtin.command: "{{ binaries_dir }}/buildx version"
+      register: buildx_ver
+      changed_when: false
+
+    - name: Display installed buildx version
+      ansible.builtin.debug:
+        msg: "Installed buildx version: {{ buildx_ver.stdout }}"
+      when: not ansible_check_mode
+
+- name: Deploy buildkit daemon
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - env
+    - user_id
+
+  vars:
+    systemd_dir: >-
+      {{ '/usr/local/lib/systemd/user/' if ansible_user_uid == 0
+        else ansible_env.HOME ~ '/.local/share/systemd/user/' }}
+    systemd_scope: "{{ (ansible_user_uid == 0) | ternary('system', 'user') }}"
+
+  tasks:
+    - name: Ensure systemd units directory exists
+      ansible.builtin.file:
+        path: "{{ systemd_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Deploy buildkit systemd unit file
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/systemd/{{ item }}"
+        dest: "{{ systemd_dir }}/{{ item }}"
+        mode: "0644"
+      loop:
+        - buildkit.service
+      notify:
+        - Reload systemd
+
+    - name: Enable and start buildkit service
+      ansible.builtin.systemd_service:
+        name: buildkit.service
+        enabled: true
+        state: started
+        scope: "{{ systemd_scope }}"
+
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+        scope: "{{ systemd_scope }}"
+
+- name: Configure buildx to use buildkit
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  gather_subset:
+    - "!all"
+    - "!min"
+    - env
+    - user_id
+
+  vars:
+    xdg_runtime_dir: >-
+      {{ ansible_env.XDG_RUNTIME_DIR | default('/run/user/' ~ ansible_user_uid) }}
+    buildx_builders: "{{ buildx_ls.stdout_lines | map('from_json') | list }}"
+    builder_name: "remote-unix"
+
+  environment:
+    # docker buildx misbehaves when docker deamon is not running
+    # fake it by pointing it to podman's socket
+    DOCKER_HOST: "unix://{{ xdg_runtime_dir }}/podman/podman.sock"
+
+  tasks:
+    - name: List buildx builders
+      ansible.builtin.command: buildx ls --format json
+      register: buildx_ls
+      changed_when: false
+
+    - name: Ensure buildx buildkit builder exists
+      ansible.builtin.command: >-
+        buildx create
+        --name {{ builder_name }}
+        --driver remote
+        unix://{{ xdg_runtime_dir }}/buildkit/buildkitd.sock
+      when: "builder_name not in (buildx_builders | map(attribute='Name') | list)"
+      changed_when: true
+      register: buildx_create
+
+    - name: Refresh buildx builders list
+      ansible.builtin.command: buildx ls --format json
+      register: buildx_ls
+      changed_when: false
+
+    - name: Ensure buildx buildkit builder is set as default
+      ansible.builtin.command: buildx use {{ builder_name }}
+      when: "not (buildx_builders | selectattr('Name', 'equalto', builder_name) | first).Current"
+      changed_when: true
+
+    - name: Hack DOCKER_HOST with Podman's socket
+      ansible.builtin.lineinfile:
+        path: "{{ ansible_env.HOME }}/.bashrc"
+        line: "export DOCKER_HOST=unix://{{ xdg_runtime_dir }}/podman/podman.sock"

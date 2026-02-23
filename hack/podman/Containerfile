@@ -1,0 +1,16 @@
+FROM docker.io/golang:1.25-alpine AS buildx-build
+
+ARG BUILDX_REF=master
+
+RUN go install github.com/docker/buildx/cmd/buildx@${BUILDX_REF}
+# Check that the binary is statically linked
+RUN ldd bin/buildx 2>&1 | grep -q "Not a valid dynamic program"
+
+
+FROM scratch
+
+COPY --from=buildx-build /go/bin/buildx /buildx
+
+ENTRYPOINT ["/buildx"]
+
+CMD ["version"]

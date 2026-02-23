@@ -1,0 +1,22 @@
+[Unit]
+Description=Podman containerized BuildKit
+Documentation=https://github.com/moby/buildkit
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=%t/buildkit
+
+[Service]
+RuntimeDirectory=buildkit
+RuntimeDirectoryMode=0770
+Environment=PODMAN_SYSTEMD_UNIT=%n
+Restart=on-failure
+TimeoutStopSec=70
+ExecStartPre=/bin/rm -f %t/%n.ctr-id
+ExecStart=/usr/bin/podman run --cidfile=%t/%n.ctr-id --cgroups=no-conmon --rm --sdnotify=conmon --replace -d --name buildkitd --privileged -v %t/buildkit:/run/buildkit:rw moby/buildkit:latest
+ExecStop=/usr/bin/podman stop --ignore --cidfile=%t/%n.ctr-id
+ExecStopPost=/usr/bin/podman rm -f --ignore --cidfile=%t/%n.ctr-id
+Type=notify
+NotifyAccess=all
+
+[Install]
+WantedBy=default.target
